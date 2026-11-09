@@ -1,0 +1,122 @@
+from google.colab import files
+up = files.upload()
+PATH = list(up.keys())[0]
+
+import re, os, zipfile, pandas as pd, numpy as np, matplotlib.pyplot as plt
+from datetime import datetime
+
+def find(cols, *keys, exclude=()):
+    for c in cols:
+        l = str(c).lower()
+        if all(k in l for k in keys) and not any(x in l for x in exclude):
+            return c
+    return None
+
+def is_time(v):
+    if isinstance(v, (pd.Timestamp, datetime)): return True
+    return bool(re.match(r'\d{4}-\d{2}-\d{2}', str(v).strip()))
+
+# ---- read every table (stacked or side by side, on any sheet)
+sheets = pd.read_excel(PATH, sheet_name=None, header=None)
+blocks = []
+for sname, raw in sheets.items():
+    R, C = raw.shape
+    for r in range(R):
+        for c in range(C - 1):
+            a, b = raw.iat[r, c], raw.iat[r, c + 1]
+            if str(a).strip().lower().startswith('time') and 'cloud' in str(b).lower():
+                cols, j = [], c
+                while j < C and pd.notna(raw.iat[r, j]):
+                    cols.append(str(raw.iat[r, j])); j += 1
+                rows, i = [], r + 1
+                while i < R and is_time(raw.iat[i, c]):
+                    rows.append(raw.iloc[i, c:c + len(cols)].tolist()); i += 1
+                if rows: blocks.append(pd.DataFrame(rows, columns=cols))
+
+D = {}
+for df in blocks:
+    times = pd.to_datetime(df.iloc[:, 0].astype(str).str.strip())
+    ph = find(df.columns, 'photo')
+    flag = (pd.to_numeric(df[ph], errors='coerce') == 100) if ph else None
+    centre = int(np.where(flag)[0][0]) if ph is not None and flag.any() else len(df) // 2
+    out = pd.DataFrame({'t': times.dt.strftime('%H:%M').values})
+    m = {'cloud': find(df.columns, 'cloud', exclude=('low', 'mid', 'high')),
+         'low': find(df.columns, 'cloud', 'low'), 'mid': find(df.columns, 'cloud', 'mid'),
+         'high': find(df.columns, 'cloud', 'high'), 'temp': find(df.columns, 'temp'),
+         'rh': find(df.columns, 'humid'), 'dew': find(df.columns, 'dew'),
+         'pres': find(df.columns, 'pressure')}
+    for k, c in m.items():
+        out[k] = pd.to_numeric(df[c], errors='coerce').values if c else np.nan
+    pt = times.iloc[centre]
+    D[f"{pt.day} {pt.strftime('%b %Y')}"] = (out, centre, pt)
+D = dict(sorted(D.items(), key=lambda kv: kv[1][2]))
+print(len(D), 'tables found:')
+for k, (d, c, pt) in D.items(): print(' ', k, '| rows:', len(d), '| photo hour row:', d.t.iloc[c])
+
+COL = dict(cloud='#5b7fa6', rh='#2e8b57', temp='#c0392b', dew='#e67e22')
+names = list(D); n = len(names); xs = np.arange(n)
+get = lambda k: [D[nm][0][k].iloc[D[nm][1]] for nm in names]
+
+# ---- Figure 1: ONE separate weather chart per date (saved as its own PNG)
+os.makedirs('per_date', exist_ok=True)
+per_date_files = []
+for k, nm in enumerate(names, 1):
+    d, c, _ = D[nm]; x = range(len(d))
+    f1, ax = plt.subplots(figsize=(8, 4.5))
+    h1, = ax.plot(x, d.cloud, '-o', ms=4, color=COL['cloud'], label='Cloud cover (%)')
+    h2, = ax.plot(x, d.rh, '-s', ms=4, color=COL['rh'], label='Humidity (%)')
+    ax.set_ylim(0, 105); ax.set_ylabel('Cloud cover / Humidity (%)')
+    ax2 = ax.twinx()
+    h3, = ax2.plot(x, d.temp, '-^', ms=4, color=COL['temp'], label='Temperature (°C)')
+    h4, = ax2.plot(x, d.dew, '--v', ms=4, color=COL['dew'], label='Dew point (°C)')
+    ax2.set_ylim(min(d.temp.min(), d.dew.min()) - 1, max(d.temp.max(), d.dew.max()) + 1)
+    ax2.set_ylabel('Temperature / Dew point (°C)')
+    ax.axvline(c, color='k', ls=':', lw=1.5)
+    ax.text(c, 102, ' photo hour', fontsize=8, va='top')
+    ax.set_xticks(list(x)); ax.set_xticklabels(d.t)
+    ax.set_xlabel('Local time, Dhaka (UTC+6)')
+    ax.set_title(nm, loc='left', fontsize=11, fontweight='bold'); ax.grid(alpha=.25)
+    f1.legend([h1, h2, h3, h4], [h.get_label() for h in (h1, h2, h3, h4)],
+              loc='lower center', ncol=4, frameon=False, fontsize=8)
+    f1.tight_layout(rect=(0, 0.07, 1, 1))
+    fn = f"per_date/Weather_{k:02d}_{nm.replace(' ', '_')}.png"
+    f1.savefig(fn, dpi=300); per_date_files.append(fn); plt.close(f1)
+with zipfile.ZipFile('per_date_charts.zip', 'w') as z:
+    for fn in per_date_files: z.write(fn)
+
+# ---- Figure 2: cloud level at photo hour
+w = 0.25
+fig2, ax = plt.subplots(figsize=(10, 4.5))
+ax.bar(xs - w, get('low'), w, label='Low cloud', color='#9db4c8')
+ax.bar(xs, get('mid'), w, label='Mid cloud', color='#6c8fb0')
+ax.bar(xs + w, get('high'), w, label='High cloud', color='#2f5578')
+ax.plot(xs, get('cloud'), 'ko-', label='Total cloud')
+ax.set_xticks(xs); ax.set_xticklabels(names, rotation=30, ha='right')
+ax.set_ylabel('Cloud cover (%)'); ax.set_ylim(0, 110); ax.legend(ncol=4, frameon=False, loc='upper center')
+ax.grid(axis='y', alpha=.25); fig2.tight_layout(); fig2.savefig('Figure2_cloud_levels.png', dpi=300)
+
+# ---- Figure 3: temperature minus dew point at photo hour
+sp = [a - b for a, b in zip(get('temp'), get('dew'))]
+fig3, ax = plt.subplots(figsize=(10, 4.5))
+ax.bar(xs, sp, color=['#c0392b' if s < 3 else '#e67e22' for s in sp])
+ax.axhline(3, color='k', ls='--', lw=1); ax.text(n - 0.5, 3.1, '3 °C', ha='right', fontsize=8)
+for i, s in enumerate(sp): ax.text(i, s + 0.1, f'{s:.1f}', ha='center', fontsize=8)
+ax.set_xticks(xs); ax.set_xticklabels(names, rotation=30, ha='right')
+ax.set_ylabel('Temperature minus dew point (°C)'); ax.grid(axis='y', alpha=.25)
+fig3.tight_layout(); fig3.savefig('Figure3_dewpoint_spread.png', dpi=300)
+
+# ---- Figure 4: pressure change around the photo hour
+fig4, ax = plt.subplots(figsize=(8, 4.5))
+for nm in names:
+    d, c, _ = D[nm]
+    ax.plot(np.arange(len(d)) - c, d.pres - d.pres.iloc[c], '-o', ms=4, label=nm)
+ax.axvline(0, color='k', ls=':', lw=1.2); ax.axhline(0, color='grey', lw=0.8)
+ax.set_xticks(range(-2, 3))
+ax.set_xlabel('Hours from photo hour'); ax.set_ylabel('Pressure change vs photo hour (hPa)')
+ax.legend(frameon=False, fontsize=8, ncol=2); ax.grid(alpha=.25)
+fig4.tight_layout(); fig4.savefig('Figure4_pressure_change.png', dpi=300)
+plt.show()
+
+for f in ['per_date_charts.zip', 'Figure2_cloud_levels.png',
+          'Figure3_dewpoint_spread.png', 'Figure4_pressure_change.png']:
+    files.download(f)
